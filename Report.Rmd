@@ -1,0 +1,304 @@
+---
+output: pdf_document
+always_allow_html: true
+bibliography: ["Data/references.bib"]
+csl: ["Data/apa.csl"]
+pdf_document: null
+geometry: margin=1.75cm
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# load required packages
+library(sf)
+library(tidyverse)
+library(kableExtra)
+library(plotly)
+library(tmap)
+
+# import data
+area_units <- st_read("Data/statsnzarea-unit-2017-generalised-version-SHP")
+crime <- read.csv("Data/Police_victimisation_data.csv")
+
+# remove full stops from crime column Area.Unit
+crime$`Area.Unit` <- str_replace(crime$`Area.Unit`, "\\.", "")
+
+# match crime column Area.Unit to area_units column AU2017_NAM
+crime_sf <- right_join(crime, area_units, by = c("Area.Unit" = "AU2017_NAM")) %>%
+  select(c(-ï..Hour, -Map.Detail.Name, -Region, -Territorial.Authority, -Mb2014, 
+           -REGC2014.label, -Ta2014.Nam, -Victimisations, -AREA_SQ_KM, 
+           -LAND_AREA_, -Shape_Leng, # remove irrelevant variables
+           `Day` = Occurrence.Day.Of.Week, # rename remaining ones
+           `ANZSOC division` = ANZSOC.Division,
+           `ANZSOC group` = ANZSOC.Group,
+           `Area unit` = Area.Unit,
+           `Hour` = Occurrence.Hour.Of.Day,
+           `Date` = Year.Month,
+           `Victimisation count` = Number.of.Victimisations)) %>% 
+  na.omit() %>% # remove NAs
+  add_count(`Area unit`, `ANZSOC division`, name = "Division count") %>% # add division count
+  add_count(`Area unit`, `ANZSOC group`, name = "Group count") %>% # add group count
+  add_count(`Area unit`, name = "All crimes") %>% # add total count
+  mutate(`ANZSOC division` = str_to_sentence(`ANZSOC division`), # fix title casing
+         `ANZSOC group` = str_to_sentence(`ANZSOC group`),
+         `Division %` = round(`Division count`/`All crimes`*100,2), # add percentages
+         `Group %` = round(`Group count`/`All crimes`*100,2),
+         `Area unit` = fct_rev(`Area unit`)) %>% # put into correct order for the charts
+  st_as_sf() # convert to sf
+
+# fix case of acronym
+crime_sf$`ANZSOC group` <- str_replace(crime_sf$`ANZSOC group`, "n.e.c.", "N.E.C.")
+
+# change from character to factor and reorder for the charts
+crime_sf$`ANZSOC division` <- factor(crime_sf$`ANZSOC division`,
+                                     levels = names(sort(table(crime_sf$`ANZSOC division`), 
+                                                         decreasing = TRUE)))
+crime_sf$`ANZSOC group` <- factor(crime_sf$`ANZSOC group`, 
+                                  levels = names(sort(table(crime_sf$`ANZSOC group`), 
+                                                      decreasing = TRUE)))
+
+# counts of each crime division per area unit
+crime_div <- crime_sf %>% 
+  select(c(`Area unit`, `ANZSOC division`)) %>%
+  count(`Area unit`, `ANZSOC division`) %>% # change the columns to ANZSOC divisions
+  pivot_wider(names_from = `ANZSOC division`, values_from = n) %>% 
+  mutate_all(~replace(., is.na(.), 0)) %>% # change NAs to 0 for summing
+  mutate(`All crimes` = rowSums(.[3:8]), # add total count
+         across(`Theft and related offences`:`All crimes`, 
+                ~na_if(., 0))) %>% # change 0s back to NA
+  rename_with(str_to_sentence) %>% # fix title casing
+  st_as_sf() # convert to sf
+
+# make a palette
+palette <- c("#7fc97f", "#4475ae", "#9abda4", "#7d449d", "#b6b1c9", "#cd1588", 
+             "#d1b3bb", "#e31864", "#edbb99", "#ce3f37", "#fdcb89", "#b35c20", 
+             "#fee791", "#8c6143", "#f2f59a", "#666666", "#9bb54a")
+
+# where each crime group is most common
+most_common_group <- crime_sf %>%                                
+  arrange(desc(`Group count`)) %>% # order by descending group count
+  group_by(`ANZSOC group`) %>% # group by ANZSOC group
+  slice(1) # take only the highest count for each group
+most_common_group %>% # format as a table
+  select(c(`ANZSOC group`, `Area unit`, `Group count`, `All crimes`)) %>%
+  st_drop_geometry() %>% # remove geometry column
+  kbl() %>%
+  kable_styling() %>%
+  row_spec(0, bold = T)
+```
+
+# Crime distribution in Christchurch
+
+It seems like crime is on the rise on Christchurch -- or at least, the news is routinely presenting us with headlines claiming that this is the case. Take for example the following: "Central Christchurch businesses on edge as street crime rises" [@chittock2022a], "Residents scared to put out bins and extra police on streets after two nights of gun violence" [@gibbs2022a], and "More than 150 reports of stolen cars in one week in Chch" [@morton2022a]. Understandably, this coverage leaves many Christchurch residents fearful that their neighbourhood could be targeted next.
+
+However, it is important to contrast the arguably sensationalist tactics of the media with the word of Christchurch Police, who say that there is no evidence to support the view that crime is increasing here [@gill2022a]. While this may be true, it can be difficult to take their word for it when we are constantly being bombarded with news stories like those already mentioned. Media outlets like to publish this type of content because they know it will get attention, as it preys upon people's fears -- so goes the saying, "if it bleeds, it leads".
+
+If we are worried about crime in Christchurch, a logical next step might be to work out which suburbs are safest and which ones are the most dangerous. Every city has its stereotypes - from my experience living here, the consensus seems to be that the eastern suburbs are the ones to avoid, while the more affluent western suburbs are (perhaps unsurprisingly) considered the safest. Putting aside the debate about the factors that contribute to these stereotypes, it would be interesting to put them to the test using crime data from the New Zealand (NZ) Police.
+
+That brings me to my question: are different types of crime more common in some parts of Christchurch over others? I chose to look at different types of crime instead of just total crime because I think it would be interesting to find out, for example, where a car is most at risk of getting stolen. My findings will be of interest to Christchurch residents, as they will serve to either confirm or dispel the suburb stereotypes as well as the general sentiment stoked by the media. The findings may also raise awareness of specific crime types if they are found to be prevalent in unexpected locations.
+
+## Methods
+
+I will be using the Victimisation Time and Place dataset from NZ Police, which "presents detailed information about where and at what times of the day and week crime victimisation occurs" [@police-a, Summary of content section]. This dataset stood out to me as the only one with an integrated interactive map and the ability to filter data according to Stats NZ geographic boundaries, which is important because I aim to produce a map of my own.
+
+I extracted data from this dataset spanning a time period from the start of records (1/3/2019) until the most recent record at the time of data collection (1/2/2023). My area of interest was Christchurch City territorial authority to limit the data to Christchurch, the boundary I chose was area units as it is the most akin to suburbs, and I included all ANZSOC divisions and groups.
+
+I also needed to download the shapefile for area units from Stats NZ to assist me in making a map [@stats2017a].
+
+Because all my variables of interest are categorical, my method options are somewhat limited. I settled on doing exploratory data analysis (EDA) with interactive stacked bar charts and mosaic charts as well as frequency tables.
+
+The stacked bar charts are best for seeing at a glance which area units have more crime than others -- in other words, for comparing quantities. Meanwhile, the mosaic charts are best for seeing the crime makeup of each area unit -- in other words, for comparing proportions. I made these charts interactive in order to display data more effectively through hover text and the ability to zoom.
+
+The frequency tables are a straightforward way of showing where each type of crime is most common, but they are mainly acting as an intermediate step before making the map markers, hence why I will include them in the appendix instead of the main report.
+
+The EDA is secondary to the star of this report, the interactive map. This method is highly visual, displaying the data in a way that enables us to identify any spatial patterns. It is also more intuitive than a table, as users can easily find locations that are of interest to them and examine the relevant data. The interactive nature of the map means that multiple categories of data can be layered, including markers which draw attention to locations where each type of crime is most common.
+
+## Results[^1]
+
+[^1]: I strongly recommend that you view the html versions of the charts and map to take advantage of the interactive elements and better display dimensions.
+
+```{r stack_bar, echo=FALSE, results=FALSE, message=FALSE, warning=FALSE, fig.show="hold", out.width="50%"}
+stack_bar_div <- ggplot(crime_sf) + 
+  geom_bar(aes(x = `Area unit`, fill = `ANZSOC division`, # variables
+               text = paste("Division count:", `Division count`, # custom hover text
+                            "<br>Total count:", `All crimes`))) + 
+  labs(title = "Crime divisions by area unit", # title
+       x = "", y = "Crime occurrences") + # axis labels
+  scale_fill_discrete(type = palette) + # colour palette
+  coord_flip() # flip x and y axes
+ggplotly(stack_bar_div, width = 1000, height = 2500, # dimensions
+         tooltip = list("Area unit", "ANZSOC division", "text")) %>% # hover text
+  layout(title = list(x = 0, y = 1, yanchor = "top"), # title position
+         legend = list(orientation = "v", x = 0.645, y = 0.97, # legend position
+                    xanchor = "center", yanchor = "top"))
+
+stack_bar_group <- ggplot(crime_sf) + 
+  geom_bar(aes(x = `Area unit`, fill = `ANZSOC group`, # variables
+               text = paste("Count:", `Group count`, # custom hover text
+                            "<br>Total count:", `All crimes`))) + 
+  labs(title = "Crime groups by area unit", # title
+       x = "", y = "Crime occurrences") + # axis labels
+  scale_fill_discrete(type = palette) + # colour palette
+  coord_flip() # flip x and y axes
+ggplotly(stack_bar_group, width = 1000, height = 2500, # dimensions
+         tooltip = list("Area unit", "ANZSOC group", "text")) %>% # hover text
+  layout(title = list(x = 0, y = 1, yanchor = "top"), # title position
+         legend = list(orientation = "v", x = 0.74, y = 0.992, # legend position
+                    xanchor = "center", yanchor = "top"))
+```
+
+```{r mosaic, echo=FALSE, results=FALSE, message=FALSE, warning=FALSE, fig.show="hold", out.width="50%"}
+mosaic_div <- ggplot(crime_sf) + 
+  geom_bar(aes(x = `Area unit`, fill = `ANZSOC division`, # variables
+               text = paste("Count:", `Division count`, # custom hover text
+                            "<br>Percentage of all crime:", `Division %`)),
+           position = position_fill()) + # convert to mosaic chart
+  labs(title = "Crime divisions by area unit", # title
+       x = "", y = "Proportion") + # axis labels
+  scale_fill_discrete(type = palette) + # colour palette
+  coord_flip() # flip x and y axes
+ggplotly(mosaic_div, width = 1000, height = 3000, # dimensions
+         tooltip = list("Area unit", "ANZSOC division", "text")) %>% # hover text
+  layout(title = list(x = 0, y = 1, yanchor = "top"), # title position
+         margin = list(t = 110), # margin size
+         legend = list(orientation = "h", x = 0.4, y = 1.03, # legend position
+                    xanchor = "center", yanchor = "top"))
+
+mosaic_group <- ggplot(crime_sf) + 
+  geom_bar(aes(x = `Area unit`, fill = `ANZSOC group`, # variables
+               text = paste("Count:", `Group count`, # custom hover text
+                            "<br>Percentage of all crime:", `Group %`)),
+           position = position_fill()) + # convert to mosaic chart
+  labs(title = "Crime groups by area unit", # title
+       x = "", y = "Proportion") + # axis labels
+  scale_fill_discrete(type = palette) + # colour palette
+  coord_flip() # flip x and y axes
+ggplotly(mosaic_group, width = 1000, height = 3000, # dimensions
+         tooltip = list("Area unit", "ANZSOC group", "text")) %>% # hover text
+  layout(title = list(x = 0, y = 1, yanchor = "top"), # title position
+         margin = list(t = 200), # margin size
+         legend = list(orientation = "h", x = 0.4, y = 1.065, # legend position
+                    xanchor = "center", yanchor = "top"))
+```
+
+### Crime divisions by area unit (stacked bar)
+
+From this chart, we can see that Cathedral Square has the highest total crime count by far with 4437, followed by Sydenham with 2799 and Linwood East with 2529.
+
+"Theft and related offences" is clearly the most common division; and since the bars are stacked in order of the overall proportion of the divisions from lowest to highest (left to right), we can see that although "Unlawful entry with intent/burglary, break and enter" is the second most common division overall, there are some area units where "Acts intended to cause injury" notably surpass it, including Cathedral Square (228 versus 979), Hagley Park (81 versus 291) and Paparua (12 versus 588). This will become clearer in the mosaic chart.
+
+At a normal zoom level, only the three most common divisions are easily visible, although Cathedral Square does stand out as having the highest counts for "Robbery, extortion and related offences" and "Sexual assault and related offences" (59 and 79 respectively).
+
+The variation in total crime counts across area units makes it difficult to analyse and compare those with very low counts, such as Akaroa Harbour and Westmorland. I assume this variation is affected by aspects like population, common targets (malls, for example) and how much activity goes on in each area unit. This is supported by Cohen and Felson's routine activities theory, which "suggests that when motivated offenders and suitable targets meet in the absence of capable guardians, crime is likely to happen", while "the absence of any of these three conditions might be enough to prevent a crime from occurring" [@branic2015a, Abstract section]. The zoom function helps us to see the smaller counts in more detail, but a mosaic chart may be more effective in this regard.
+
+### Crime groups by area unit (stacked bar)
+
+"Theft from retail premises" is the most common group, and of course Cathedral Square still has the highest total crime count. However, Linwood East surpasses Cathedral Square for the most "Theft from retail premises" occurrences, with 2092 compared to 1601.
+
+Again, it is difficult to analyse and compare the area units with low total crime counts. The colour palette required for so many categories also contributes negatively, as the chart becomes very visually busy and some colours are difficult to tell apart (even for people with normal vision, let alone colourblind people).
+
+One thing that stood out to me is how some of the area units with lower crime counts have an unusually high proportion of "Theft of motor vehicle parts or contents" occurrences, such as Cashmere East and Styx (113 out of 174 and 145 out of 248 respectively). These area units tend to be remote areas with parks or reserves, so I assume that criminals are taking advantage of people parking their cars in quiet places and going on long walks. This is another phenomenon which can be made clearer using a mosaic chart.
+
+### Crime divisions by area unit (mosaic)
+
+Westmorland stands out as the area unit with the highest proportion of "Abduction..." occurrences at 5% of its total. However this only equates to a count of 1, while Cathedral Square is responsible for the most "Abductions..." with 4 (only 0.09% of its total). The same occurs with other divisions; Parklands may have the highest proportion of "Sexual assault..." occurrences at 5.79%, but this is a count of 11 compared to Cathedral Square's 79 (1.78%).
+
+This is the problem with mosaic charts -- they make low counts look just as important as high counts. For another example, Port Levy appears to have an unusually high proportion of "Acts intended to cause injury", at two thirds of its total. While this is not an incorrect observation, the issue is that these "Acts intended to cause injury" account for two out of a total of three crimes, which is not so impressive. Meanwhile, in Paparua "Acts intended to cause injury" account for 93.19% of all its crimes, and this percentage is made up of a much more noteworthy 588 occurrences. This is likely to be largely due to Paparua being where Christchurch Men's and Women's Prisons are located.
+
+Inlets-Banks Peninsula Bays is notable for having 100% of its crimes being "Theft and related offences" (but only a count of 2). Excluding this, Paparua has the highest percentage for any one division as mentioned above, with the runner-up being Merrin where 91.53% of crimes are "Theft and related offences" (count of 216). Such a fact may not have appeared noteworthy when looking at the stacked bar chart.
+
+### Crime groups by area unit (mosaic)
+
+Going back to the "Theft of motor vehicle parts or contents" group, we can now see even more clearly that this crime group makes up large proportions of greenspace areas such as Cashmere East, which has the highest proportion of this group at 64.94% (count of 113).
+
+As the bars are arranged in order of the overall proportion of the groups from lowest to highest (left to right), you would expect "Theft from retail premises" (furthest to the right) to have the highest proportion in most if not all area units, but this is only the case in 23 out of the 127 area units. My theory is that not all area units have tempting retail targets, and those that do are getting targeted enough to give this group the overall highest proportion -- this goes back to the routine activities theory discussed earlier.
+
+```{r crime_map, echo=FALSE, results=FALSE, message=FALSE, warning=FALSE, out.height="30%", fig.align="center"}
+tmap_mode("view") # change to interactive mode
+tm_shape(crime_div) +
+  tm_polygons(c("Theft and related offences", # map layers
+                "Unlawful entry with intent/burglary, break and enter", 
+                "Acts intended to cause injury", 
+                "Robbery, extortion and related offences", 
+                "Sexual assault and related offences", 
+                "Abduction, harassment and other related offences against a person", 
+                "All crimes"),
+              palette = "Reds", # colour palette
+              style = c("jenks", "jenks", "jenks", # breaks style for each layer
+                        "jenks", "jenks", "cat", "jenks"),
+              textNA = "NA", # NA label in legend
+              legend.format = c(digits = 0), # whole numbers in legend
+              popup.format = c(digits = 0), # whole numbers in popups
+              id = "Area unit") + # hover text
+  tm_facets(as.layers = TRUE) + # display as layers instead of facets
+  tm_shape(most_common_group, name = "Most common markers") + # add markers
+  tm_markers(jitter = 0.2, # space out markers in the same area unit
+             clustering = FALSE, # no clustering
+             id = "ANZSOC group", # hover text
+             popup.vars = c("Area unit:" = "Area unit", # customise popup text
+                            "ANZSOC division:" = "ANZSOC division",
+                            "Group count" = "Group count")) + 
+  tm_scale_bar(position = c("left", "bottom")) + # scale bar
+  tm_layout(title = "Crime distribution in Christchurch") # main title
+```
+
+### Crime distribution in Christchurch (map)[^2]
+
+[^2]: I chose to use ANZSOC divisions as the layers instead of groups to keep the layers (and legends) to a minimum. However, the most common markers use ANZSOC groups because more markers (and therefore more information) can be displayed without adverse effects, and the groups had more variation in location than the divisions did (see the appendix for details).
+
+I did not notice any particularly unusual patterns across any of the map layers. Most notably, there is no visible east/west contrast as we would expect according to the stereotypes.
+
+All of the layers are most concentrated in Cathedral Square as we would expect from the EDA, although Paparua also stands out in the "Acts intended to cause injury" layer (also to be expected).
+
+Banks Peninsula appears to be quite peaceful in comparison with Christchurch City itself, even getting a majority of NA results across its area units for the "Robbery...", "Sexual assault..." and "Abduction..." divisions (although the latter division is NA in most places overall).
+
+Finally, we have the markers which show where each crime group is most common. "Theft from retail premises" is most common in Linwood East, "Unlawful entry with intent/burglary..." is most common in Sydenham, "Theft of motor vehicle parts or contents" is most common in Hagley Park, "Illegal use of a motor vehicle" is most common in Sydenham, "Blackmail and extortion" is most common in Riccarton, "Theft of a motor vehicle" is most common in Wigram, and the remaining 11 groups are most common in Cathedral Square.
+
+## Discussion
+
+The purpose of this report was to find out whether different types of crime are more common in some parts of Christchurch over others. My findings suggest that this is indeed the case, however crime distributions do not necessarily adhere to the east/west stereotype like many people may assume. So if our best bet for staying safe is not as simple as sticking to the west side of the city, what advice can we glean from the findings?
+
+First and foremost, the most common markers provide an indication of the most at-risk locations for each crime group. If you are worried about your car being broken into for example, then perhaps avoid parking it in the Hagley Park area unit when possible, or in any area unit largely comprised of greenspace for that matter. Secondly, if you are desperate to avoid crime of any sort, it may be best for you to avoid the Cathedral Square area unit -- maybe you should consider moving to the relatively crime-free Banks Peninsula instead.
+
+In my view, the spatial variation in my findings is largely supported by the routine activities theory -- after all, it is described as "an environmental, place-based explanation of crime, where the behavioral patterns and intersections of people in time and space influence when and where crimes occur" [@branic2015a, Abstract section]. When it comes to my recommendations on how to address inequalities between the area units in terms of how many crimes occur in each, I would refer back to this theory and suggest that perhaps there needs to be a shift in the balance, such as increased police presence or better security to decrease the suitability of potential targets.
+
+As for my recommendations for further research, this study could be strengthened by conducting further spatial analysis such as testing for local indicators of spatial association (LISA). I think it would be interesting to do a spatiotemporal study to see how the crime distributions have changed over time. It would also be intriguing to bring other data into the equation, such as ethnicity or household income data from Stats NZ, to see how they correlate and whether that adheres to stereotypes.
+
+\newpage
+
+## Appendix
+
+### Most common locations of crime divisions
+
+```{r most_common_div, echo=FALSE}
+most_common_div <- crime_sf %>%                                
+  arrange(desc(`Division count`)) %>% # order by descending division count
+  group_by(`ANZSOC division`) %>% # group by ANZSOC division
+  slice(1) # take only the highest count for each division
+most_common_div %>% # format as a table
+  select(c(`ANZSOC division`, `Area unit`, `Division count`, `All crimes`)) %>%
+  st_drop_geometry() %>% # remove geometry column
+  kbl() %>%
+  kable_styling(latex_options = "hold_position", position = "center") %>%
+  row_spec(0, bold = T)
+```
+
+### Most common locations of crime groups
+
+```{r most_common_group, echo=FALSE}
+most_common_group <- crime_sf %>%                                
+  arrange(desc(`Group count`)) %>% # order by descending group count
+  group_by(`ANZSOC group`) %>% # group by ANZSOC group
+  slice(1) # take only the highest count for each group
+most_common_group %>% # format as a table
+  select(c(`ANZSOC group`, `Area unit`, `Group count`, `All crimes`)) %>%
+  st_drop_geometry() %>% # remove geometry column
+  kbl() %>%
+  kable_styling(latex_options = "hold_position", position = "center") %>%
+  row_spec(0, bold = T)
+```
+
+\newpage
+
+## References
